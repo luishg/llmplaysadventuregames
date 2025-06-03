@@ -11,6 +11,9 @@ An AI system that uses Large Language Models (LLMs) to play point-and-click adve
 - **Session Logging**: Saves screenshots and LLM responses for analysis
 - **Grid-Based Navigation**: Uses a numbered cell system for precise interaction
 - **Long-term Strategy Development**: Updates game context, map, and objectives every 10 iterations
+- **Twitch Chat Integration**: Allows viewers to provide hints and suggestions through chat
+- **Real-time Chat Monitoring**: Displays chat messages and user suggestions in a dedicated window
+- **User Command Execution**: Processes and executes valid commands from chat users
 
 ## New Features
 
@@ -42,6 +45,33 @@ Every 10 iterations, the system pauses to update three key components:
 - Extended game screen text duration
 - Takes snapshots every 3 seconds
 - Ensures dialogue and important text is captured
+
+### Twitch Chat Integration
+The system now includes a powerful Twitch chat integration that allows viewers to participate in the gameplay:
+
+1. **Chat Command System**:
+   - Users can provide hints and suggestions through chat
+   - Commands are processed every 5 iterations
+   - Supports both cell-based and pixel-based coordinates
+   - Valid commands are displayed in real-time
+
+2. **Chat Monitor Window**:
+   - Real-time display of chat messages
+   - Shows connection status and statistics
+   - Lists recent user suggestions
+   - Tracks executed commands
+
+3. **Command Processing**:
+   - Validates user commands before execution
+   - Converts pixel coordinates to cell numbers
+   - Maintains a history of executed commands
+   - Provides feedback on command execution
+
+4. **Safety Features**:
+   - Command validation and sanitization
+   - Rate limiting for command execution
+   - Error handling for invalid commands
+   - Connection status monitoring
 
 ## Performance
 
@@ -80,22 +110,22 @@ Complex games like "Day of the Tentacle" (with multiple timelines) could provide
 
 1. Clone the repository
 2. Install required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
+    ```bash
+    pip install -r requirements.txt
+    ```
 3. Install X11 tools:
-   ```bash
+        ```bash
    sudo dnf install xdotool xorg-x11-utils
-   ```
+        ```
 4. (Optional) Set up Ollama for local LLM support
 5. (Optional) Configure API keys for remote LLM services
 
 ## Usage
 
 1. Run the script:
-   ```bash
-   python play.py
-   ```
+    ```bash
+    python play.py
+    ```
 2. Select the game window when prompted
 3. Choose an LLM model
 4. Watch the AI play!

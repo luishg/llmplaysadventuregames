@@ -19,10 +19,14 @@ from pathlib import Path
 import re # Add this import at the top of your file
 import threading
 import tkinter as tk
+from tkinter import ttk  # Add ttk import
+from tkinter import scrolledtext  # Correct import for scrolledtext
 import queue
 from PIL import Image, ImageDraw, ImageFont, ImageTk # Added ImageTk
-from grid import add_numbered_grid_to_image, get_cell_coordinates # Import grid functions
+from grid import add_numbered_grid_to_image, get_cell_coordinates, get_cell_number_from_pixel # Import grid functions
 import random
+import chat
+from chat import get_user_clicks, initialize_twitch, TWITCH_TOKEN, get_recent_user_clicks, is_chat_running, get_chat_stats, start_twitch_bot  # Import TWITCH_TOKEN, new functions
 
 try:
     import ollama
@@ -64,14 +68,21 @@ DEFAULT_GAME_WINDOW_TITLE = "Maniac Mansion"
 SESSIONS_DIR = "sessions"
 SCREENSHOT_INTERVAL = 3  # Seconds to wait after LLM response before next screenshot
 CLICK_INTERVAL = 2       # Seconds between multiple clicks from a single LLM response
+CHAT_CHECK_INTERVAL = 5  # Check chat every N iterations
 INTERNAL_CROP = {"top": 0, "bottom": 0, "left": 0, "right": 0} # ScummVM padding
 
-# --- API Keys (PLACEHOLDERS - VERY IMPORTANT: Use environment variables or secure config) ---
-# It's highly recommended to load these from environment variables or a secure config file.
-# Example: OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_API_KEY = "" # Placeholder from your prompt
-ANTHROPIC_API_KEY = "" # Placeholder from your prompt
-HUGGINGFACE_TOKEN = "" # Add your Hugging Face token here
+# --- API Keys (Load from environment variables) ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
+
+# Validate API keys
+if not OPENAI_API_KEY:
+    print("[!] Warning: OPENAI_API_KEY environment variable not set. OpenAI models will not be available.")
+if not ANTHROPIC_API_KEY:
+    print("[!] Warning: ANTHROPIC_API_KEY environment variable not set. Anthropic models will not be available.")
+if not HUGGINGFACE_TOKEN:
+    print("[!] Warning: HUGGINGFACE_TOKEN environment variable not set. Hugging Face models will not be available.")
 
 # --- Global LLM Game Context ---
 LLM_GAME_CONTEXT = "I'm playing a point-and-click adventure game. I have to explore how the story unfolds through what I see on the screen."
@@ -97,6 +108,14 @@ Key Game Elements:
 
 Bottom Left Action Menu when available:
   - The action menu is at the bottom-left of the screen
+  - Some common action coordinates (cells numbers):
+    - Open: 129
+    - Close: 145
+    - Look at: 131
+    - Push: 135
+    - Pull: 151
+    - Pick up: 116
+    - Use: 119
   - If not action is selected, walking will be the default action if you click any area
   - Tu use specific action, first, select an action/verb (center of the text) from the menu (e.g., "Open", "Use", "Pick Up")
   - Then click on the target object or area to perform the action
@@ -115,7 +134,8 @@ Movement and Exploration:
 
 Important Tips:
   - You can perform multiple actions in sequence, BUT define one clic per action
-  - Try different actions on the same object
+  - Avoid to repeat the same actions on your recent action list
+  - Prioritizeze exploration, looking for exist to new areas (screen edges, stairs, doors)
   - Look for hidden passages and secret areas
   - Pay attention to character reactions
   - Some items can be combined in inventory
@@ -143,7 +163,6 @@ LLM_PROMPT_TEMPLATE = """You are an AI assistant playing an adventure game. Anal
 IMPORTANT - COORDINATE SYSTEM FOR CLICKING:
 The image has grid overlay with numbered cells (ignore the grid and numbers to play and describe the scene as you see it)
 - Cells are numbered from left to right, top to bottom
-- You can see the cell numbers directly in the grid overlay
 - When you want to click somewhere:
   1. Look at the grid overlay and find the cell number closest to where you want to click
   2. Use that cell number as the "coordinates" value
@@ -536,8 +555,8 @@ def find_game_window_details(title_to_find, id_to_find=None):
             "top": content_y,
             "width": content_width,
             "height": content_height,
-            "window_id": final_window_id,
-            "original_x": geometry["X"],
+            "window_id": final_window_id, 
+            "original_x": geometry["X"], 
             "original_y": geometry["Y"]
         }
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -594,7 +613,7 @@ def get_openai_llm_analysis(model_id, base64_image_data_url, image_width, image_
     
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     # System prompt can remain general, as the detailed context is now in the user prompt
-    system_prompt = "You are an AI agent playing the game Maniac Mansion. Analyze the provided game screenshot and decide on the best next action. The image has a reference grid. Output your response in JSON format with 'description', 'action_plan', and 'clicks' (list of [x,y] coordinates relative to the image, using the grid)."
+    #system_prompt = "You are an AI agent playing the game Maniac Mansion. Analyze the provided game screenshot and decide on the best next action. The image has a reference grid. Output your response in JSON format with 'description', 'action_plan', and 'clicks' (list of [x,y] coordinates relative to the image, using the grid)."
     user_prompt_text = get_llm_prompt_text(image_width, image_height) 
 
     try:
@@ -666,7 +685,7 @@ def get_anthropic_llm_analysis(model_id, base64_image_raw, image_width, image_he
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     # System prompt can remain general
-    system_prompt = "You are an AI agent playing the game Maniac Mansion. Analyze the provided game screenshot and decide on the best next action. The image has a reference grid. Output your response in JSON format with 'description', 'action_plan', and 'clicks' (list of [x,y] coordinates relative to the image, using the grid)."
+    #system_prompt = "You are an AI agent playing the game Maniac Mansion. Analyze the provided game screenshot and decide on the best next action. The image has a reference grid. Output your response in JSON format with 'description', 'action_plan', and 'clicks' (list of [x,y] coordinates relative to the image, using the grid)."
     user_prompt_text = get_llm_prompt_text(image_width, image_height) 
 
     try:
@@ -1030,26 +1049,35 @@ def print_iteration_summary(llm_response, window_details):
                 print("    [!] Window details missing, cannot display screen coordinates for planned clicks.")
                 for idx, click_obj in enumerate(click_list_llm, 1):
                     if isinstance(click_obj, dict) and "coordinates" in click_obj and "reason" in click_obj:
-                        print(f"    {idx}. LLM Coords: {click_obj['coordinates']}, Reason: {click_obj['reason']}")
+                        print(f"    {idx}. Cell: {click_obj['coordinates']}, Reason: {click_obj['reason']}")
                     else:
                         print(f"    {idx}. Invalid click object format: {click_obj}")
                 print("-" * 40) # Footer for this section
                 return
 
             for idx, click_obj in enumerate(click_list_llm, 1): 
-                if isinstance(click_obj, dict) and "coordinates" in click_obj and isinstance(click_obj["coordinates"], list) and len(click_obj["coordinates"]) == 2 and "reason" in click_obj:
-                    click_coords_llm = click_obj["coordinates"]
+                # Fix: Check for cell number (integer) format that execute_clicks expects
+                if isinstance(click_obj, dict) and "coordinates" in click_obj and isinstance(click_obj["coordinates"], int) and click_obj["coordinates"] > 0 and "reason" in click_obj:
+                    cell_number = click_obj["coordinates"]
                     click_reason = click_obj.get("reason", "N/A")
 
-                    img_x_llm = int(click_coords_llm[0])
-                    img_y_llm = int(click_coords_llm[1])
+                    # Get pixel coordinates from cell number using grid.py
+                    coords = get_cell_coordinates(
+                        cell_number,
+                        image_width=window_details["width"],
+                        image_height=window_details["height"],
+                        cell_size=40  # Using the same cell size as in grid.py
+                    )
                     
-                    # No need to convert Y coordinates anymore since they're already in top-down format
-                    screen_x = window_details["left"] + img_x_llm
-                    screen_y = window_details["top"] + img_y_llm
-                    
-                    # Simplified display of planned clicks
-                    print(f"    {idx}. {click_reason} -> LLM Coords: ({img_x_llm},{img_y_llm}) -> Screen: ({screen_x},{screen_y})")
+                    if coords:
+                        img_x_llm, img_y_llm = coords
+                        # Convert to screen coordinates
+                        screen_x = window_details["left"] + img_x_llm
+                        screen_y = window_details["top"] + img_y_llm
+                        
+                        print(f"    {idx}. {click_reason} -> Cell: {cell_number} -> Image: ({img_x_llm},{img_y_llm}) -> Screen: ({screen_x},{screen_y})")
+                    else:
+                        print(f"    {idx}. {click_reason} -> Cell: {cell_number} (INVALID CELL NUMBER)")
                 else:
                     print(f"    {idx}. Invalid click object format from LLM: {click_obj}")
         elif click_list_llm == []: 
@@ -1063,185 +1091,235 @@ def print_iteration_summary(llm_response, window_details):
     print("-" * 40) # Footer for the whole summary
 
 class StatusWindow:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Maniac Mansion AI - Live Status")
-        self.root.geometry("550x780")  # Increased height for new section
-        self.root.attributes('-topmost', True)
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Game Status")
+        self.root.geometry("700x900")  # Increased size for better readability
         self.closed = False
 
-        # --- Info Frame ---
-        info_frame = tk.Frame(self.root, pady=5)
-        info_frame.pack(fill="x", padx=10)
-
-        self.step_var = tk.StringVar()
-        self.llm_model_var = tk.StringVar()
-        self.window_name_var = tk.StringVar()
-        self.image_resolution_var = tk.StringVar()  # New variable for image resolution
-        self.token_size_var = tk.StringVar()       # New variable for token size
-
-        tk.Label(info_frame, text="Step:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(info_frame, textvariable=self.step_var, font=("Arial", 10)).grid(row=0, column=1, sticky="w", padx=5)
-
-        tk.Label(info_frame, text="LLM Model:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w")
-        tk.Label(info_frame, textvariable=self.llm_model_var, font=("Arial", 10), wraplength=350).grid(row=1, column=1, sticky="w", padx=5)
-        
-        tk.Label(info_frame, text="Capturing:", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w")
-        tk.Label(info_frame, textvariable=self.window_name_var, font=("Arial", 10), wraplength=350).grid(row=2, column=1, sticky="w", padx=5)
-
-        # Add new rows for image resolution and token size
-        tk.Label(info_frame, text="Image Resolution:", font=("Arial", 10, "bold")).grid(row=3, column=0, sticky="w")
-        tk.Label(info_frame, textvariable=self.image_resolution_var, font=("Arial", 10)).grid(row=3, column=1, sticky="w", padx=5)
-
-        tk.Label(info_frame, text="Token Size:", font=("Arial", 10, "bold")).grid(row=4, column=0, sticky="w")
-        tk.Label(info_frame, textvariable=self.token_size_var, font=("Arial", 10)).grid(row=4, column=1, sticky="w", padx=5)
-
-        separator1 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN)
-        separator1.pack(fill="x", padx=5, pady=5)
-
-        # --- Vision Frame (Text Description + Image) ---
-        vision_frame = tk.Frame(self.root)
-        vision_frame.pack(fill="x", padx=10)
-        tk.Label(vision_frame, text="Vision (LLM Description):", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.desc_var = tk.StringVar()
-        self.desc_label = tk.Label(vision_frame, textvariable=self.desc_var, wraplength=520, justify="left", font=("Arial", 9))
-        self.desc_label.pack(anchor="w", fill="x")
-
-        tk.Label(vision_frame, text="Last Image Sent to LLM (with Clicks):", font=("Arial", 10, "bold"), pady=5).pack(anchor="w") 
-        self.image_label = tk.Label(vision_frame) 
-        self.image_label.pack(anchor="center", pady=5)
-        self.photo_image = None 
-        self.max_image_display_width = 520
-        self.max_image_display_height = 320
-
-        separator2 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN)
-        separator2.pack(fill="x", padx=5, pady=5)
-
-        # --- Plan Frame ---
-        plan_frame = tk.Frame(self.root)
-        plan_frame.pack(fill="x", padx=10)
-        tk.Label(plan_frame, text="Plan (LLM Action):", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.plan_var = tk.StringVar()
-        self.plan_label = tk.Label(plan_frame, textvariable=self.plan_var, wraplength=520, justify="left", font=("Arial", 9))
-        self.plan_label.pack(anchor="w", fill="x")
-
-        separator3 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN)
-        separator3.pack(fill="x", padx=5, pady=5)
-        
-        # --- Clicks Frame ---
-        clicks_frame = tk.Frame(self.root)
-        clicks_frame.pack(fill="x", padx=10) # Changed fill and expand
-        tk.Label(clicks_frame, text="Last Clicks & Objectives:", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.clicks_text = tk.Text(clicks_frame, wrap=tk.WORD, height=3, font=("Arial", 9), relief=tk.FLAT, bg=self.root.cget('bg')) # Adjusted height
-        self.clicks_text.pack(anchor="w", fill="x")
-        self.clicks_text.config(state=tk.DISABLED)
-
-        separator4 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN) # New separator
-        separator4.pack(fill="x", padx=5, pady=5)
-
-        # --- Inner Dialogue/Context Frame ---
-        context_frame = tk.Frame(self.root)
-        context_frame.pack(fill="both", expand=True, padx=10) # Allow this to take remaining space
-        tk.Label(context_frame, text="Inner Dialogue (Long Term Context):", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.context_var = tk.StringVar()
-        self.context_label = tk.Label(context_frame, textvariable=self.context_var, wraplength=520, justify="left", font=("Arial", 9), anchor="nw")
-        self.context_label.pack(anchor="w", fill="both", expand=True)
-
-
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # Create update queue
         self.update_queue = queue.Queue()
-        self.poll_updates()
-
-    def update_status(self, step, llm_model, window_name, description, action_plan, clicks_str, game_context, pil_image=None, click_coords_list=None, image_resolution=None, token_size=None): 
-        self.update_queue.put((step, llm_model, window_name, description, action_plan, clicks_str, game_context, pil_image, click_coords_list, image_resolution, token_size))
-
-    def _draw_clicks_on_image(self, image, click_coords_list, image_height_llm):
-        """Draws circles for each click coordinate on the image."""
-        if not image or not click_coords_list:
-            return image
         
-        # Ensure image is RGBA to handle alpha for fill color
-        img_to_draw_on = image.copy()
-        if img_to_draw_on.mode != 'RGBA':
-            img_to_draw_on = img_to_draw_on.convert('RGBA')
-
-        draw = ImageDraw.Draw(img_to_draw_on)
-        radius = 8  # Increased radius for bigger points
-        # Bright magenta fill, semi-transparent, with a solid black outline
-        fill_color = (255, 0, 255, 180)  # Bright Magenta, semi-transparent
-        outline_color = (0, 0, 0, 255)    # Solid Black
-        outline_width = 2                 # Thicker outline
-
-        for click_obj in click_coords_list:
-            if isinstance(click_obj, dict) and "coordinates" in click_obj:
-                coords_llm = click_obj["coordinates"]
-                if isinstance(coords_llm, list) and len(coords_llm) == 2:
-                    try:
-                        x_llm = int(coords_llm[0])
-                        y_llm = int(coords_llm[1]) # Y from bottom
-
-                        # Convert Y from LLM (bottom-up) to Pillow (top-down)
-                        y_pil = image_height_llm - 1 - y_llm
-                        
-                        # Define the bounding box for the ellipse (circle)
-                        x1 = x_llm - radius
-                        y1 = y_pil - radius
-                        x2 = x_llm + radius
-                        y2 = y_pil + radius
-                        draw.ellipse([x1, y1, x2, y2], fill=fill_color, outline=outline_color, width=outline_width)
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Invalid click coordinates for drawing: {coords_llm}, error: {e}")
-        return img_to_draw_on
-
+        # Create main frame with scrollbar
+        main_frame = ttk.Frame(root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create sections
+        self.create_status_section(main_frame)
+        self.create_game_section(main_frame)
+        self.create_chat_section(main_frame)
+        
+        # Initialize chat connection status
+        self.chat_connected = False
+        self.update_chat_status()
+        
+        # Set up window close handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Start polling for updates
+        self.poll_updates()
+        
     def poll_updates(self):
+        """Poll the update queue and process any pending updates."""
         try:
             while not self.update_queue.empty():
-                step, llm_model, window_name, desc, plan, clicks_str, game_context, pil_image, click_coords_list, image_resolution, token_size = self.update_queue.get_nowait() 
-                self.step_var.set(str(step))
-                self.llm_model_var.set(llm_model or "N/A")
-                self.window_name_var.set(window_name or "N/A")
-                self.image_resolution_var.set(image_resolution or "N/A")
-                self.token_size_var.set(token_size or "N/A")
-                self.desc_var.set(desc or "N/A")
-                self.plan_var.set(plan or "N/A")
-                self.context_var.set(game_context or "N/A")
-                
-                self.clicks_text.config(state=tk.NORMAL)
-                self.clicks_text.delete("1.0", tk.END)
-                self.clicks_text.insert(tk.END, clicks_str or "N/A")
-                self.clicks_text.config(state=tk.DISABLED)
-
-                if pil_image:
-                    try:
-                        img_copy = pil_image.copy() 
-                        
-                        if click_coords_list:
-                            llm_image_height = img_copy.height 
-                            img_copy = self._draw_clicks_on_image(img_copy, click_coords_list, llm_image_height)
-
-                        resample_method = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-                        img_copy.thumbnail((self.max_image_display_width, self.max_image_display_height), resample_method)
-                        
-                        self.photo_image = ImageTk.PhotoImage(img_copy)
-                        self.image_label.config(image=self.photo_image)
-                        self.image_label.image = self.photo_image # Keep a reference
-                    except Exception as e:
-                        logger.error(f"Error processing image for status window: {e}", exc_info=True)
-                        self.image_label.config(image='') # Clear image on error
-                else:
-                    self.image_label.config(image='') # Clear image if None provided
+                update_data = self.update_queue.get_nowait()
+                self._process_update(update_data)
         except queue.Empty:
             pass
         
         if not self.closed:
             self.root.after(100, self.poll_updates)
+            
+    def _process_update(self, update_data):
+        try:
+            # Update iteration counter
+            self.iteration_label.config(text=f"Iteration: {update_data['iteration']}")
+            
+            # Update LLM info (name only)
+            self.llm_name_label.config(text=f"LLM: {update_data['llm_name']}")
+            
+            # Update game info
+            self.game_name_label.config(text=update_data['game_name'])
+            
+            # Update screenshot if provided
+            if update_data.get('image'):
+                # Convert PIL Image to PhotoImage
+                photo = ImageTk.PhotoImage(update_data['image'])
+                self.screenshot_label.configure(image=photo)
+                self.screenshot_label.image = photo  # Keep a reference!
+            else:
+                self.screenshot_label.configure(image='')
+            
+            # Update vision description
+            self.vision_text.config(state=tk.NORMAL)
+            self.vision_text.delete(1.0, tk.END)
+            self.vision_text.insert(tk.END, update_data['status'])
+            self.vision_text.config(state=tk.DISABLED)
+            
+            # Update action plan
+            self.plan_text.config(state=tk.NORMAL)
+            self.plan_text.delete(1.0, tk.END)
+            self.plan_text.insert(tk.END, update_data['action'])
+            self.plan_text.config(state=tk.DISABLED)
+            
+            # Update clicks
+            self.clicks_text.config(state=tk.NORMAL)
+            self.clicks_text.delete(1.0, tk.END)
+            self.clicks_text.insert(tk.END, update_data['clicks_info'])
+            self.clicks_text.config(state=tk.DISABLED)
+            
+            # Update chat data if provided
+            if update_data.get('chat_data'):
+                username, timestamp, clicks = update_data['chat_data']
+                # Format timestamp
+                if timestamp:
+                    time_str = timestamp.strftime("%H:%M:%S")
+                    self.chat_timestamp_label.config(text=f"Last Check: {time_str}")
+                
+                if clicks:
+                    # Check if clicks is a list of dictionaries (actual click objects) or a string (status message)
+                    if isinstance(clicks, list) and all(isinstance(click, dict) and 'reason' in click for click in clicks):
+                        # Process actual click objects
+                        suggestions_text = f"User: {username}\n"
+                        for i, click in enumerate(clicks, 1):
+                            suggestions_text += f"{i}. {click['reason']}\n"
+                        self.chat_suggestions.config(text=suggestions_text, foreground="black")
+                    elif isinstance(clicks, str):
+                        # Handle string status messages
+                        self.chat_suggestions.config(text=f"Status: {clicks}", foreground="blue")
+                    else:
+                        # Fallback for unexpected format
+                        self.chat_suggestions.config(text="Invalid suggestion format", foreground="red")
+                else:
+                    self.chat_suggestions.config(text="No suggestions found", foreground="gray")
+            else:
+                self.chat_suggestions.config(text="No suggestions yet", foreground="gray")
+                self.chat_timestamp_label.config(text="Last Check: Never")
+                
+        except Exception as e:
+            print(f"Error processing update: {e}")
+            logger.error(f"Error processing update: {e}")
 
+    def update_status(self, iteration, llm_name, game_name, status, action, clicks_info, context, image, clicks, image_size, total_tokens, chat_data=None):
+        """Queue an update to the status window."""
+        if not self.closed:
+            update_data = {
+                'iteration': iteration,
+                'llm_name': llm_name,
+                'game_name': game_name,
+                'status': status,
+                'action': action,
+                'clicks_info': clicks_info,
+                'context': context,
+                'image': image,
+                'clicks': clicks,
+                'image_size': image_size,
+                'total_tokens': total_tokens,
+                'chat_data': chat_data
+            }
+            self.update_queue.put(update_data)
+        
     def on_close(self):
+        """Handle window close event"""
         print("Status window closed by user.")
         logger.info("Status window closed by user.")
         self.closed = True
         if hasattr(self.root, 'quit'):
             self.root.quit()
+
+    def create_status_section(self, parent):
+        # Status section
+        status_frame = ttk.LabelFrame(parent, text="General Information", padding="5")
+        status_frame.pack(fill=tk.X, pady=5)
+        
+        # Status info frame
+        status_info_frame = ttk.Frame(status_frame)
+        status_info_frame.pack(fill=tk.X, pady=2)
+        
+        # Iteration counter
+        ttk.Label(status_info_frame, text="Iteration:").pack(side=tk.LEFT)
+        self.iteration_label = ttk.Label(status_info_frame, text="0")
+        self.iteration_label.pack(side=tk.LEFT, padx=5)
+        
+        # LLM name
+        ttk.Label(status_info_frame, text="LLM:").pack(side=tk.LEFT, padx=(10,0))
+        self.llm_name_label = ttk.Label(status_info_frame, text="N/A")
+        self.llm_name_label.pack(side=tk.LEFT, padx=5)
+        
+    def create_game_section(self, parent):
+        # Game section
+        game_frame = ttk.LabelFrame(parent, text="Last Iteration")
+        game_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Game name
+        game_info_frame = ttk.Frame(game_frame)
+        game_info_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(game_info_frame, text="Game:").pack(side=tk.LEFT)
+        self.game_name_label = ttk.Label(game_info_frame, text="N/A")
+        self.game_name_label.pack(side=tk.LEFT, padx=5)
+        
+        # Screenshot display - increased size to match LLM input
+        self.screenshot_label = ttk.Label(game_frame)
+        self.screenshot_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Vision Description
+        vision_frame = ttk.LabelFrame(game_frame, text="Vision Description")
+        vision_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.vision_text = scrolledtext.ScrolledText(vision_frame, wrap=tk.WORD, height=4)
+        self.vision_text.pack(fill=tk.X, padx=5, pady=5)
+        self.vision_text.config(state=tk.DISABLED)
+        
+        # Action Plan
+        plan_frame = ttk.LabelFrame(game_frame, text="Action Plan")
+        plan_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.plan_text = scrolledtext.ScrolledText(plan_frame, wrap=tk.WORD, height=3)
+        self.plan_text.pack(fill=tk.X, padx=5, pady=5)
+        self.plan_text.config(state=tk.DISABLED)
+        
+        # Action Clicks
+        clicks_frame = ttk.LabelFrame(game_frame, text="Action Clicks")
+        clicks_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.clicks_text = scrolledtext.ScrolledText(clicks_frame, wrap=tk.WORD, height=3)
+        self.clicks_text.pack(fill=tk.X, padx=5, pady=5)
+        self.clicks_text.config(state=tk.DISABLED)
+        
+    def create_chat_section(self, parent):
+        # Chat section
+        chat_frame = ttk.LabelFrame(parent, text="Chat Integration", padding="5")
+        chat_frame.pack(fill=tk.X, pady=5)
+        
+        # Chat status and timestamp
+        chat_info_frame = ttk.Frame(chat_frame)
+        chat_info_frame.pack(fill=tk.X, pady=2)
+        
+        self.chat_status_label = ttk.Label(chat_info_frame, text="Chat: Not connected")
+        self.chat_status_label.pack(side=tk.LEFT)
+        
+        self.chat_timestamp_label = ttk.Label(chat_info_frame, text="Last Check: Never")
+        self.chat_timestamp_label.pack(side=tk.RIGHT)
+        
+        # Chat suggestions
+        self.chat_suggestions = ttk.Label(chat_frame, text="No suggestions yet", wraplength=400)
+        self.chat_suggestions.pack(fill=tk.X, pady=2)
+        
+    def update_chat_status(self):
+        """Update the chat connection status"""
+        if not chat.TWITCH_TOKEN:  # Use chat.TWITCH_TOKEN instead of TWITCH_TOKEN
+            status_text = "Chat Status: Disabled (No token set)"
+            status_color = "red"
+        elif is_chat_running():  # Use the new is_chat_running() function
+            status_text = "Chat Status: Connected"
+            status_color = "green"
+        else:
+            status_text = "Chat Status: Disconnected"
+            status_color = "red"
+        
+        self.chat_status_label.config(text=status_text, foreground=status_color)
 
 def show_model_menu():
     """Show the model selection menu."""
@@ -1418,125 +1496,282 @@ def show_remote_models():
 class ContextMemoryWindow:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Maniac Mansion AI - Context Memory")
-        self.root.geometry("600x800")
-        self.root.attributes('-topmost', True)
+        self.root.title("Context Memory")
+        self.root.geometry("800x600")
         self.closed = False
-
-        # --- Game Instructions Frame ---
-        instructions_frame = tk.Frame(self.root)
-        instructions_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
-        tk.Label(instructions_frame, text="Game Instructions:", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.instructions_text = tk.Text(instructions_frame, wrap=tk.WORD, height=10, font=("Arial", 9))
-        self.instructions_text.pack(fill="both", expand=True)
-        self.instructions_text.config(state=tk.DISABLED)
-
-        separator1 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN)
-        separator1.pack(fill="x", padx=5, pady=5)
-
-        # --- Game Map Frame ---
-        map_frame = tk.Frame(self.root)
-        map_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        # Create main frame
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        tk.Label(map_frame, text="Game Map:", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.map_text = tk.Text(map_frame, wrap=tk.WORD, height=8, font=("Arial", 9))
-        self.map_text.pack(fill="both", expand=True)
-        self.map_text.config(state=tk.DISABLED)
-
-        separator2 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN)
-        separator2.pack(fill="x", padx=5, pady=5)
-
-        # --- Game Objectives Frame ---
-        objectives_frame = tk.Frame(self.root)
-        objectives_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        # Create sections
+        self.create_context_section(main_frame)
+        self.create_map_section(main_frame)
+        self.create_objectives_section(main_frame)
         
-        tk.Label(objectives_frame, text="Game Objectives:", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.objectives_text = tk.Text(objectives_frame, wrap=tk.WORD, height=8, font=("Arial", 9))
-        self.objectives_text.pack(fill="both", expand=True)
-        self.objectives_text.config(state=tk.DISABLED)
-
-        separator3 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN)
-        separator3.pack(fill="x", padx=5, pady=5)
-
-        # --- Last Actions Frame ---
-        actions_frame = tk.Frame(self.root)
-        actions_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        # Set up update polling
+        self.update_queue = queue.Queue()
+        self.root.after(100, self.poll_updates)
         
-        tk.Label(actions_frame, text="Last Actions (Recent to Old):", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.actions_text = tk.Text(actions_frame, wrap=tk.WORD, height=8, font=("Arial", 9))
-        self.actions_text.pack(fill="both", expand=True)
-        self.actions_text.config(state=tk.DISABLED)
-
-        separator4 = tk.Frame(self.root, height=2, bd=1, relief=tk.SUNKEN)
-        separator4.pack(fill="x", padx=5, pady=5)
-
-        # --- Game Context Frame ---
-        context_frame = tk.Frame(self.root)
-        context_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        # Set up close handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         
-        tk.Label(context_frame, text="Game Context:", font=("Arial", 10, "bold")).pack(anchor="w")
-        self.context_text = tk.Text(context_frame, wrap=tk.WORD, height=5, font=("Arial", 9))
-        self.context_text.pack(fill="both", expand=True)
+        # Store the last update data
+        self.last_update = None
+
+    def create_context_section(self, parent):
+        # Context section
+        context_frame = ttk.LabelFrame(parent, text="Game Context")
+        context_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Create text widget with scrollbar
+        self.context_text = scrolledtext.ScrolledText(context_frame, wrap=tk.WORD, height=10)
+        self.context_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.context_text.config(state=tk.DISABLED)
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.update_queue = queue.Queue()
-        self.poll_updates()
+    def create_map_section(self, parent):
+        # Map section
+        map_frame = ttk.LabelFrame(parent, text="Game Map")
+        map_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Create text widget with scrollbar
+        self.map_text = scrolledtext.ScrolledText(map_frame, wrap=tk.WORD, height=10)
+        self.map_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.map_text.config(state=tk.DISABLED)
+
+    def create_objectives_section(self, parent):
+        # Objectives section
+        objectives_frame = ttk.LabelFrame(parent, text="Game Objectives")
+        objectives_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Create text widget with scrollbar
+        self.objectives_text = scrolledtext.ScrolledText(objectives_frame, wrap=tk.WORD, height=10)
+        self.objectives_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.objectives_text.config(state=tk.DISABLED)
 
     def update_context(self, game_instructions, last_actions, game_context, game_map=None, game_objectives=None):
-        """Updates the context memory window with new information."""
-        self.update_queue.put((game_instructions, last_actions, game_context, game_map, game_objectives))
+        """Update the context window with new information."""
+        if not self.closed:
+            update_data = {
+                'game_context': game_context,
+                'game_map': game_map,
+                'game_objectives': game_objectives
+            }
+            self.update_queue.put(update_data)
 
     def poll_updates(self):
+        """Poll for updates from the queue."""
         try:
-            while not self.update_queue.empty():
-                game_instructions, last_actions, game_context, game_map, game_objectives = self.update_queue.get_nowait()
-                
-                # Update Game Instructions
-                self.instructions_text.config(state=tk.NORMAL)
-                self.instructions_text.delete("1.0", tk.END)
-                self.instructions_text.insert(tk.END, game_instructions)
-                self.instructions_text.config(state=tk.DISABLED)
-                
-                # Update Game Map
-                self.map_text.config(state=tk.NORMAL)
-                self.map_text.delete("1.0", tk.END)
-                self.map_text.insert(tk.END, game_map or "No map data available yet.")
-                self.map_text.config(state=tk.DISABLED)
-                
-                # Update Game Objectives
-                self.objectives_text.config(state=tk.NORMAL)
-                self.objectives_text.delete("1.0", tk.END)
-                self.objectives_text.insert(tk.END, game_objectives or "No objectives identified yet.")
-                self.objectives_text.config(state=tk.DISABLED)
-                
-                # Update Last Actions (in reverse order - most recent first)
-                self.actions_text.config(state=tk.NORMAL)
-                self.actions_text.delete("1.0", tk.END)
-                if last_actions:
-                    # Join actions in reverse order (most recent first)
-                    actions_text = "\n".join(reversed(last_actions))
-                    self.actions_text.insert(tk.END, actions_text)
-                else:
-                    self.actions_text.insert(tk.END, "No actions recorded yet.")
-                self.actions_text.config(state=tk.DISABLED)
-                
-                # Update Game Context
-                self.context_text.config(state=tk.NORMAL)
-                self.context_text.delete("1.0", tk.END)
-                self.context_text.insert(tk.END, game_context)
-                self.context_text.config(state=tk.DISABLED)
-                
-        except queue.Empty:
-            pass
+            while True:
+                try:
+                    update_data = self.update_queue.get_nowait()
+                    if update_data:
+                        # Update context
+                        self.context_text.config(state=tk.NORMAL)
+                        self.context_text.delete(1.0, tk.END)
+                        self.context_text.insert(tk.END, update_data['game_context'])
+                        self.context_text.config(state=tk.DISABLED)
+                        
+                        # Update map
+                        self.map_text.config(state=tk.NORMAL)
+                        self.map_text.delete(1.0, tk.END)
+                        if update_data.get('game_map'):
+                            self.map_text.insert(tk.END, update_data['game_map'])
+                        else:
+                            self.map_text.insert(tk.END, "No map data available")
+                        self.map_text.config(state=tk.DISABLED)
+                        
+                        # Update objectives
+                        self.objectives_text.config(state=tk.NORMAL)
+                        self.objectives_text.delete(1.0, tk.END)
+                        if update_data.get('game_objectives'):
+                            self.objectives_text.insert(tk.END, update_data['game_objectives'])
+                        else:
+                            self.objectives_text.insert(tk.END, "No objectives available")
+                        self.objectives_text.config(state=tk.DISABLED)
+                        
+                        # Store the last update
+                        self.last_update = update_data
+                except queue.Empty:
+                    break
+        except Exception as e:
+            print(f"Error in poll_updates: {e}")
+            logger.error(f"Error in poll_updates: {e}")
         
+        # Schedule next poll if window is still open
         if not self.closed:
             self.root.after(100, self.poll_updates)
 
     def on_close(self):
         print("Context memory window closed by user.")
         logger.info("Context memory window closed by user.")
+        self.closed = True
+        if hasattr(self.root, 'quit'):
+            self.root.quit()
+
+class ChatMonitorWindow:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Twitch Chat Monitor")
+        self.root.geometry("500x600")
+        self.root.attributes('-topmost', True)
+        self.closed = False
+        
+        # Create main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Chat status section
+        status_frame = ttk.LabelFrame(main_frame, text="Chat Connection Status", padding="5")
+        status_frame.pack(fill=tk.X, pady=5)
+        
+        self.connection_status = ttk.Label(status_frame, text="Checking connection...", font=("Arial", 10, "bold"))
+        self.connection_status.pack(fill=tk.X, pady=2)
+        
+        self.stats_label = ttk.Label(status_frame, text="Stats: Loading...", font=("Arial", 9))
+        self.stats_label.pack(fill=tk.X, pady=2)
+        
+        # Chat messages section
+        messages_frame = ttk.LabelFrame(main_frame, text="Recent Chat Messages", padding="5")
+        messages_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Create text widget with scrollbar
+        text_frame = ttk.Frame(messages_frame)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.messages_text = tk.Text(text_frame, wrap=tk.WORD, font=("Arial", 9), state=tk.DISABLED)
+        messages_scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.messages_text.yview)
+        self.messages_text.configure(yscrollcommand=messages_scrollbar.set)
+        self.messages_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        messages_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Auto-scroll to bottom
+        self.auto_scroll = tk.BooleanVar(value=True)
+        ttk.Checkbutton(messages_frame, text="Auto-scroll to bottom", 
+                       variable=self.auto_scroll).pack(anchor="w", pady=2)
+        
+        # Commands section
+        commands_frame = ttk.LabelFrame(main_frame, text="Valid Commands", padding="5")
+        commands_frame.pack(fill=tk.X, pady=5)
+        
+        commands_text = (
+            "Valid chat commands:\n"
+            "• click 42 - Click on cell number 42\n"
+            "• click (123, 456) - Click at pixel coordinates\n"
+            "• Click commands are processed every 5 iterations"
+        )
+        ttk.Label(commands_frame, text=commands_text, font=("Arial", 9), 
+                 foreground="darkblue").pack(anchor="w")
+        
+        # Recent clicks section
+        recent_frame = ttk.LabelFrame(main_frame, text="Recent User Clicks", padding="5")
+        recent_frame.pack(fill=tk.X, pady=5)
+        
+        self.recent_clicks_label = ttk.Label(recent_frame, text="No recent clicks", 
+                                           font=("Arial", 9), foreground="gray")
+        self.recent_clicks_label.pack(fill=tk.X, pady=2)
+        
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.update_queue = queue.Queue()
+        self.last_message_count = 0
+        
+        # Start monitoring
+        self.monitor_chat()
+        self.poll_updates()
+        
+    def monitor_chat(self):
+        """Monitor chat messages and update display"""
+        try:
+            if is_chat_running():
+                # Get chat statistics
+                stats = get_chat_stats()
+                stats_text = (f"Connected | Messages: {stats['total_messages']} | "
+                            f"Users: {stats['unique_users']} | Recent: {stats['recent_activity']}")
+                
+                self.update_queue.put(("status", "Chat Status: Connected ✓", "green"))
+                self.update_queue.put(("stats", stats_text, "black"))
+                
+                # Get recent messages
+                if hasattr(chat, '_chat_messages') and chat._chat_messages:
+                    messages = chat._chat_messages[-50:]  # Last 50 messages
+                    if len(messages) > self.last_message_count:
+                        # New messages available
+                        new_messages = messages[self.last_message_count:]
+                        for msg in new_messages:
+                            timestamp = msg['timestamp'].strftime("%H:%M:%S")
+                            user = msg['user']
+                            content = msg['content']
+                            has_clicks = len(msg['clicks']) > 0
+                            
+                            # Format message
+                            if has_clicks:
+                                formatted_msg = f"[{timestamp}] {user}: {content} 🎯\n"
+                                self.update_queue.put(("message", formatted_msg, "darkgreen"))
+                            else:
+                                formatted_msg = f"[{timestamp}] {user}: {content}\n"
+                                self.update_queue.put(("message", formatted_msg, "black"))
+                        
+                        self.last_message_count = len(messages)
+                
+                # Get recent user clicks
+                username, timestamp, clicks = get_recent_user_clicks()
+                if username and clicks:
+                    time_str = timestamp.strftime("%H:%M:%S") if timestamp else "Unknown"
+                    clicks_text = f"Last: {username} at {time_str} ({len(clicks)} clicks)"
+                    self.update_queue.put(("recent_clicks", clicks_text, "darkgreen"))
+                else:
+                    self.update_queue.put(("recent_clicks", "No recent clicks", "gray"))
+                    
+            else:
+                self.update_queue.put(("status", "Chat Status: Disconnected ✗", "red"))
+                self.update_queue.put(("stats", "Not connected to chat", "red"))
+                
+        except Exception as e:
+            self.update_queue.put(("status", f"Chat Status: Error - {str(e)}", "red"))
+        
+        # Schedule next update
+        if not self.closed:
+            self.root.after(2000, self.monitor_chat)  # Update every 2 seconds
+    
+    def poll_updates(self):
+        """Process queued updates"""
+        try:
+            while not self.update_queue.empty():
+                update_type, text, color = self.update_queue.get_nowait()
+                
+                if update_type == "status":
+                    self.connection_status.config(text=text, foreground=color)
+                elif update_type == "stats":
+                    self.stats_label.config(text=text, foreground=color)
+                elif update_type == "message":
+                    self.messages_text.config(state=tk.NORMAL)
+                    self.messages_text.insert(tk.END, text)
+                    self.messages_text.config(state=tk.DISABLED)
+                    
+                    # Auto-scroll to bottom if enabled
+                    if self.auto_scroll.get():
+                        self.messages_text.see(tk.END)
+                        
+                    # Keep only last 1000 lines to prevent memory issues
+                    lines = self.messages_text.get("1.0", tk.END).count('\n')
+                    if lines > 1000:
+                        self.messages_text.config(state=tk.NORMAL)
+                        self.messages_text.delete("1.0", "100.0")  # Delete first 100 lines
+                        self.messages_text.config(state=tk.DISABLED)
+                        
+                elif update_type == "recent_clicks":
+                    self.recent_clicks_label.config(text=text, foreground=color)
+                    
+        except queue.Empty:
+            pass
+        
+        if not self.closed:
+            self.root.after(100, self.poll_updates)
+    
+    def on_close(self):
+        """Handle window close event"""
+        print("Chat monitor window closed by user.")
+        logger.info("Chat monitor window closed by user.")
         self.closed = True
         if hasattr(self.root, 'quit'):
             self.root.quit()
@@ -1638,10 +1873,10 @@ Recent Observations (in chronological order):
 {chr(10).join(f"{i+1}. {desc}" for i, desc in enumerate(descriptions))}
 
 Based on these observations and the current map, create an updated map that:
-1. Lists all discovered rooms/locations
+1. Lists all discovered rooms/locations. Please group similar room descriptions into a single room, do not create multiple rooms for the same location.
 2. Shows how rooms are connected (e.g., "Room A connects to Room B via door")
 3. Includes any special notes about rooms (e.g., "Room C has a locked chest")
-4. Maintains previous map information while adding new discoveries
+4. Maintains previous map information while adding new discoveries triying to create a mental map of the game
 
 Output your response in this format:
 ```json
@@ -1659,7 +1894,7 @@ Output your response in this format:
 
 def get_objectives_update_prompt(descriptions, current_objectives):
     """Generate a prompt for the LLM to update the game objectives."""
-    return f"""You are an AI playing Monkey Island 2. Review the following sequence of observations and current objectives to update the game's goals.
+    return f"""You are an AI playing a graphic adventure game. Review the following sequence of observations and current objectives to update the game's long term goals.
 
 Current Objectives:
 {current_objectives}
@@ -1807,9 +2042,43 @@ def update_game_objectives(selected_model_info, descriptions, current_objectives
         logger.error(f"Error updating game objectives: {e}", exc_info=True)
         return False
 
+# --- Safe Status Window Update Functions ---
+def safe_status_update(status_window_ref, iteration, llm_name, game_name, status, action, clicks_info, context, image, clicks, image_size, total_tokens, chat_data=None):
+    """Safely update the status window with error handling."""
+    try:
+        if hasattr(status_window_ref, 'closed') and not status_window_ref.closed:
+            status_window_ref.update_status(
+                iteration, llm_name, game_name, status, action, clicks_info, 
+                context, image, clicks, image_size, total_tokens, chat_data
+            )
+            print(f"[DEBUG] Status window updated successfully for iteration {iteration}")
+            return True
+        else:
+            print(f"[!] Status window is closed or invalid, cannot update iteration {iteration}")
+            return False
+    except Exception as e:
+        print(f"[!] Error updating status window for iteration {iteration}: {e}")
+        logger.error(f"Error updating status window for iteration {iteration}: {e}", exc_info=True)
+        return False
+
+def safe_context_update(context_window_ref, game_instructions, last_actions, game_context, game_map=None, game_objectives=None):
+    """Safely update the context window with error handling."""
+    try:
+        if hasattr(context_window_ref, 'closed') and not context_window_ref.closed:
+            context_window_ref.update_context(game_instructions, last_actions, game_context, game_map, game_objectives)
+            print(f"[DEBUG] Context window updated successfully")
+            return True
+        else:
+            print(f"[!] Context window is closed or invalid, cannot update")
+            return False
+    except Exception as e:
+        print(f"[!] Error updating context window: {e}")
+        logger.error(f"Error updating context window: {e}", exc_info=True)
+        return False
+
 # --- Main Application Logic (to be run in a thread) ---
 # Renamed main_loop to game_logic_thread_target
-def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both window instances
+def game_logic_thread_target(status_window_ref, context_window_ref, chat_monitor_ref, chat_enabled): # Add chat_monitor_ref parameter
     global SELECTED_GAME_WINDOW_TITLE, SELECTED_GAME_WINDOW_ID, selected_llm_info, LLM_GAME_CONTEXT, TEMP_DESCRIPTIONS, LLM_LAST_ACTIONS, GAME_MAP_GRAPH, GAME_OBJECTIVES
 
     # Initialize global variables if not already set
@@ -1854,21 +2123,23 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
     llm_providers = get_llm_providers() 
     if not llm_providers:
         print("[!] No LLM models available. Check configuration and Ollama setup. Exiting game logic thread.") 
-        status_window_ref.update_status(0, "N/A", "N/A", "Setup Error", "No LLM models available.", "N/A", LLM_GAME_CONTEXT, None, None, None, None)
-        context_window_ref.update_context(GAME_INSTRUCTIONS, LLM_LAST_ACTIONS, LLM_GAME_CONTEXT)
+        safe_status_update(status_window_ref, 0, "N/A", "N/A", "Setup Error", "No LLM models available.", "N/A", LLM_GAME_CONTEXT, None, None, None, None)
+        safe_context_update(context_window_ref, GAME_INSTRUCTIONS, LLM_LAST_ACTIONS, LLM_GAME_CONTEXT)
         return
     
     selected_llm_info = select_llm_model(llm_providers) 
     if not selected_llm_info:
         print("[!] No LLM model selected. Exiting game logic thread.") 
-        status_window_ref.update_status(0, "N/A", "N/A", "Setup Error", "No LLM model selected.", "N/A", LLM_GAME_CONTEXT, None, None, None, None)
-        context_window_ref.update_context(GAME_INSTRUCTIONS, LLM_LAST_ACTIONS, LLM_GAME_CONTEXT)
+        safe_status_update(status_window_ref, 0, "N/A", "N/A", "Setup Error", "No LLM model selected.", "N/A", LLM_GAME_CONTEXT, None, None, None, None)
+        safe_context_update(context_window_ref, GAME_INSTRUCTIONS, LLM_LAST_ACTIONS, LLM_GAME_CONTEXT)
         return
 
     print(f"Targeting: '{SELECTED_GAME_WINDOW_TITLE}' (ID: {SELECTED_GAME_WINDOW_ID or 'Search by name'})")
     print(f"Using LLM: {selected_llm_info['display_name']}.")
+    print(f"Chat Integration: {'Enabled' if chat_enabled else 'Disabled'} (initialized at startup)")
     print("Setup complete. Starting main game loop in background thread...")
-    logger.info(f"Setup complete. Using LLM: {selected_llm_info['display_name']}. Targeting window: '{SELECTED_GAME_WINDOW_TITLE}' (ID: {SELECTED_GAME_WINDOW_ID or 'N/A'}).")
+    logger.info(f"Setup complete. Using LLM: {selected_llm_info['display_name']}. Targeting window: '{SELECTED_GAME_WINDOW_TITLE}' (ID: {SELECTED_GAME_WINDOW_ID or 'N/A'}). Chat: {'Enabled' if chat_enabled else 'Disabled'}.")
+
 
     # Test visualization of common coordinates
     print("\n=== Testing Grid System and Random Cells ===")
@@ -1930,9 +2201,17 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
     
     iteration_count = 0
     try:
-        while not status_window_ref.closed and not context_window_ref.closed:
+        while not status_window_ref.closed and not context_window_ref.closed and not chat_monitor_ref.closed:
             iteration_count += 1
             print(f"\n\n{'=' * 20} Iteration: {iteration_count} {'=' * 20}")
+
+            # Initialize current_game_window_name_for_status early to avoid NameError
+            game_window_details = find_game_window_details(SELECTED_GAME_WINDOW_TITLE, SELECTED_GAME_WINDOW_ID)
+            current_game_window_name_for_status = SELECTED_GAME_WINDOW_TITLE # Default
+            if game_window_details and game_window_details.get('window_id'):
+                current_game_window_name_for_status = f"{SELECTED_GAME_WINDOW_TITLE} (ID: {game_window_details.get('window_id')})"
+            elif not game_window_details:
+                 current_game_window_name_for_status = f"{SELECTED_GAME_WINDOW_TITLE} (Not Found)"
 
             # Check if this is a context update iteration
             is_context_update_iteration = (iteration_count % DESCRIPTIONS_BEFORE_UPDATE) == 0
@@ -2007,12 +2286,14 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
                 print("Waiting for next game iteration...")
                 time.sleep(SCREENSHOT_INTERVAL)  # Give time to read the update messages
 
-            game_window_details = find_game_window_details(SELECTED_GAME_WINDOW_TITLE, SELECTED_GAME_WINDOW_ID)
-            current_game_window_name_for_status = SELECTED_GAME_WINDOW_TITLE # Default
-            if game_window_details and game_window_details.get('window_id'):
-                current_game_window_name_for_status = f"{SELECTED_GAME_WINDOW_TITLE} (ID: {game_window_details.get('window_id')})"
-            elif not game_window_details:
-                 current_game_window_name_for_status = f"{SELECTED_GAME_WINDOW_TITLE} (Not Found)"
+            # Don't re-fetch game_window_details if we already have it from above
+            if not game_window_details:
+                game_window_details = find_game_window_details(SELECTED_GAME_WINDOW_TITLE, SELECTED_GAME_WINDOW_ID)
+                # Update the status name again in case it changed
+                if game_window_details and game_window_details.get('window_id'):
+                    current_game_window_name_for_status = f"{SELECTED_GAME_WINDOW_TITLE} (ID: {game_window_details.get('window_id')})"
+                elif not game_window_details:
+                     current_game_window_name_for_status = f"{SELECTED_GAME_WINDOW_TITLE} (Not Found)"
 
             # Initialize per-iteration variables for status updates
             llm_desc = "N/A"
@@ -2026,7 +2307,8 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
                 print(f"[!] Game window '{SELECTED_GAME_WINDOW_TITLE}' not found. Retrying in {SCREENSHOT_INTERVAL}s...") 
                 llm_desc = "Game window not found."
                 llm_plan = "Waiting for game window..."
-                status_window_ref.update_status(
+                safe_status_update(
+                    status_window_ref,
                     iteration_count,
                     selected_llm_info.get('display_name', 'N/A') if 'selected_llm_info' in globals() and selected_llm_info else 'N/A',
                     current_game_window_name_for_status,
@@ -2039,11 +2321,11 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
                     None,
                     None
                 )
-                context_window_ref.update_context(GAME_INSTRUCTIONS, LLM_LAST_ACTIONS, LLM_GAME_CONTEXT)
+                safe_context_update(context_window_ref, GAME_INSTRUCTIONS, LLM_LAST_ACTIONS, LLM_GAME_CONTEXT)
                 time.sleep(SCREENSHOT_INTERVAL) 
-                if status_window_ref.closed or context_window_ref.closed: break
+                if status_window_ref.closed or context_window_ref.closed or chat_monitor_ref.closed: break
                 continue
-
+            
             print(f"Processing game screen from '{SELECTED_GAME_WINDOW_TITLE}' (ID: {game_window_details.get('window_id', 'N/A')})")
             print(f"Sending to LLM: {selected_llm_info['display_name']} for analysis...")
             current_screenshot = capture_screenshot_of_region(game_window_details)
@@ -2067,7 +2349,7 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
                     None  # No token size
                 )
                 time.sleep(SCREENSHOT_INTERVAL)
-                if status_window_ref.closed or context_window_ref.closed: break
+                if status_window_ref.closed or context_window_ref.closed or chat_monitor_ref.closed: break
                 continue
             
             # If we reach here, current_screenshot is valid.
@@ -2115,6 +2397,16 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
                 # raw_click_coords_for_status remains None
 
             # Update the status window with all information before executing clicks
+            # Include current chat information for better user awareness
+            current_chat_info = None
+            if chat_enabled:
+                chat_stats = get_chat_stats()
+                current_chat_info = (
+                    chat_stats.get('last_user_with_clicks'),
+                    datetime.now(),
+                    f"Next chat check in {CHAT_CHECK_INTERVAL - (iteration_count % CHAT_CHECK_INTERVAL)} iterations"
+                )
+            
             status_window_ref.update_status(
                 iteration_count,
                 selected_llm_info['display_name'],
@@ -2126,7 +2418,8 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
                 image_to_save_for_session, # Pass the PIL image (could be None if screenshot failed)
                 raw_click_coords_for_status, # Now guaranteed to be defined
                 f"{image_to_save_for_session.size[0]}x{image_to_save_for_session.size[1]}" if image_to_save_for_session else None, # Pass image resolution
-                total_tokens # Pass token size
+                total_tokens, # Pass token size
+                current_chat_info # Pass current chat information
             )
             # Always update context window with current map and objectives
             context_window_ref.update_context(
@@ -2155,11 +2448,11 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
             print(f"\n--- End of Iteration {iteration_count}. Waiting {SCREENSHOT_INTERVAL}s ---")
             # Wait for the full SCREENSHOT_INTERVAL before next iteration
             for _ in range(SCREENSHOT_INTERVAL * 10): 
-                if status_window_ref.closed or context_window_ref.closed:
+                if status_window_ref.closed or context_window_ref.closed or chat_monitor_ref.closed:
                     break
                 time.sleep(0.1)
-            if status_window_ref.closed or context_window_ref.closed:
-                print("One or both windows closed, exiting game logic loop.")
+            if status_window_ref.closed or context_window_ref.closed or chat_monitor_ref.closed:
+                print("One or more windows closed, exiting game logic loop.")
                 break
 
             if llm_analysis_json and isinstance(llm_analysis_json, dict):
@@ -2180,6 +2473,123 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
                 GAME_OBJECTIVES  # Always pass current objectives
             )
 
+
+            # Check chat every CHAT_CHECK_INTERVAL iterations
+            if chat_enabled and iteration_count % CHAT_CHECK_INTERVAL == 0:
+                print("\n=== Checking Twitch Chat for User Suggestions ===")
+                
+                # Get chat statistics
+                chat_stats = get_chat_stats()
+                print(f"[CHAT] Stats: {chat_stats['total_messages']} messages, {chat_stats['unique_users']} users, {chat_stats['recent_activity']} recent")
+                if chat_stats['last_user_with_clicks']:
+                    print(f"[CHAT] Last user with clicks: {chat_stats['last_user_with_clicks']}")
+
+                try:
+                    username, timestamp, chat_clicks = get_recent_user_clicks()
+                    
+                    if chat_clicks and username:
+                        print(f"\n[CHAT] Found {len(chat_clicks)} clicks from last user: {username}")
+                        print(f"[CHAT] Timestamp: {timestamp.strftime('%H:%M:%S') if timestamp else 'Unknown'}")
+                        print("User commands:")
+                        for i, click in enumerate(chat_clicks, 1):
+                            print(f"  {i}. {click['reason']}")
+                        
+                        # Update status window with chat suggestions before executing
+                        status_window_ref.update_status(
+                            iteration_count,
+                            selected_llm_info['display_name'],
+                            current_game_window_name_for_status,
+                            f"Executing clicks from {username}",
+                            f"Processing {len(chat_clicks)} user commands from {timestamp.strftime('%H:%M:%S') if timestamp else 'recent'}",
+                            f"Chat user: {username} | Commands: {len(chat_clicks)}",
+                            LLM_GAME_CONTEXT,
+                            image_to_save_for_session,
+                            None,
+                            f"{image_to_save_for_session.size[0]}x{image_to_save_for_session.size[1]}" if image_to_save_for_session else None,
+                            total_tokens,
+                            (username, timestamp, chat_clicks)  # Pass chat suggestions
+                        )
+                        
+                        # Convert chat clicks to the format expected by execute_clicks
+                        clicks_to_perform = []
+                        for click in chat_clicks:
+                            if click['type'] == 'cell':
+                                clicks_to_perform.append({
+                                    'coordinates': click['coordinates'],
+                                    'reason': click['reason']
+                                })
+                            elif click['type'] == 'pixel':
+                                # Convert pixel coordinates to cell number
+                                x, y = click['coordinates']
+                                cell_number = get_cell_number_from_pixel(x, y, game_window_details['width'], game_window_details['height'])
+                                if cell_number:
+                                    clicks_to_perform.append({
+                                        'coordinates': cell_number,
+                                        'reason': click['reason']
+                                    })
+                        
+                        # Execute all clicks from the user
+                        if clicks_to_perform:
+                            print(f"\n[CHAT] Executing {len(clicks_to_perform)} clicks for {username}:")
+                            execute_clicks(clicks_to_perform, game_window_details)
+                            
+                            # Update status window after execution
+                            status_window_ref.update_status(
+                                iteration_count,
+                                selected_llm_info['display_name'],
+                                current_game_window_name_for_status,
+                                f"✓ Executed {len(clicks_to_perform)} clicks from {username}",
+                                f"Completed user commands from {timestamp.strftime('%H:%M:%S') if timestamp else 'recent'}",
+                                "\n".join(f"✓ {i+1}. {click['reason']}" for i, click in enumerate(clicks_to_perform)),
+                                LLM_GAME_CONTEXT,
+                                image_to_save_for_session,
+                                clicks_to_perform,
+                                f"{image_to_save_for_session.size[0]}x{image_to_save_for_session.size[1]}" if image_to_save_for_session else None,
+                                total_tokens,
+                                (username, timestamp, chat_clicks)  # Pass chat suggestions
+                            )
+                            print(f"[CHAT] ✓ All {len(clicks_to_perform)} clicks executed successfully")
+                            continue  # Skip LLM analysis for this iteration
+                        else:
+                            print("[CHAT] ⚠ No valid clicks could be processed from chat commands")
+                    else:
+                        print("[CHAT] No recent user clicks found")
+                        # Update status window to show nothing to execute from chat
+                        status_window_ref.update_status(
+                            iteration_count,
+                            selected_llm_info['display_name'],
+                            current_game_window_name_for_status,
+                            "Nothing to execute from chat",
+                            "No recent user suggestions found",
+                            f"Last user: {chat_stats['last_user_with_clicks'] or 'None'} | Next check: {CHAT_CHECK_INTERVAL - (iteration_count % CHAT_CHECK_INTERVAL)} iterations",
+                            LLM_GAME_CONTEXT,
+                            image_to_save_for_session,
+                            None,
+                            f"{image_to_save_for_session.size[0]}x{image_to_save_for_session.size[1]}" if image_to_save_for_session else None,
+                            total_tokens,
+                            None  # No chat suggestions
+                        )
+                        
+                except Exception as e:
+                    print(f"[CHAT] ❌ Error checking chat: {e}")
+                    # Update chat status in status window
+                    status_window_ref.chat_connected = is_chat_running()
+                    status_window_ref.update_chat_status()
+                    status_window_ref.update_status(
+                        iteration_count,
+                        selected_llm_info['display_name'],
+                        current_game_window_name_for_status,
+                        "Chat connection error",
+                        "Error while checking for user suggestions",
+                        f"Error: {str(e)} | Chat running: {is_chat_running()}",
+                        LLM_GAME_CONTEXT,
+                        image_to_save_for_session,
+                        None,
+                        f"{image_to_save_for_session.size[0]}x{image_to_save_for_session.size[1]}" if image_to_save_for_session else None,
+                        total_tokens,
+                        None  # No chat suggestions
+                    )
+
     except KeyboardInterrupt:
         print("\nKeyboard interrupt detected in game logic thread. Shutting down...") 
         logger.info("Keyboard interrupt detected in game logic thread. Shutting down gracefully...")
@@ -2189,10 +2599,13 @@ def game_logic_thread_target(status_window_ref, context_window_ref): # Pass both
     finally:
         if hasattr(status_window_ref, 'closed') and not status_window_ref.closed: 
             print("Game logic thread finished. Closing status window.")
-            status_window_ref.on_close()
+            status_window_ref.on_close() 
         if hasattr(context_window_ref, 'closed') and not context_window_ref.closed:
             print("Game logic thread finished. Closing context window.")
             context_window_ref.on_close()
+        if hasattr(chat_monitor_ref, 'closed') and not chat_monitor_ref.closed:
+            print("Game logic thread finished. Closing chat monitor window.")
+            chat_monitor_ref.on_close()
 
         session_path_msg = active_session_dir if 'active_session_dir' in locals() and active_session_dir else SESSIONS_DIR
         print(f"\nAI Player game logic thread stopped. Session data saved in: {session_path_msg}") 
@@ -2386,25 +2799,40 @@ def main():
 if __name__ == "__main__":
     Path(SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
     
+    # Initialize Twitch chat at startup (before GUI)
+    print("=== Initializing Twitch Chat ===")
+    chat_enabled = start_twitch_bot()
+    if chat_enabled:
+        print("[✓] Twitch chat integration enabled")
+    else:
+        print("[!] Twitch chat integration disabled")
+    
     if not (OPENAI_API_KEY and OPENAI_API_KEY.startswith("sk-") and len(OPENAI_API_KEY) > 20):
         print("[!] OpenAI API key seems invalid or is a placeholder. OpenAI models may not work.")
     if not (ANTHROPIC_API_KEY and ANTHROPIC_API_KEY.startswith("sk-ant-") and len(ANTHROPIC_API_KEY) > 20):
         print("[!] Anthropic API key seems invalid or is a placeholder. Anthropic models may not work.")
     
-    status_window_instance = StatusWindow()
+    # Create root window for status window
+    status_root = tk.Tk()
+    status_window_instance = StatusWindow(status_root)
     context_window_instance = ContextMemoryWindow()  # Create the context memory window
+    chat_monitor_instance = ChatMonitorWindow()  # Create the chat monitor window
+    
+    # Set initial chat status in status window
+    status_window_instance.chat_connected = chat_enabled
+    status_window_instance.update_chat_status()
     
     # Initial update of context window
     context_window_instance.update_context(GAME_INSTRUCTIONS, LLM_LAST_ACTIONS, LLM_GAME_CONTEXT)
     
-    game_thread = threading.Thread(target=game_logic_thread_target, args=(status_window_instance, context_window_instance,), daemon=True)
+    game_thread = threading.Thread(target=game_logic_thread_target, args=(status_window_instance, context_window_instance, chat_monitor_instance, chat_enabled), daemon=True)
     game_thread.start()
 
     try:
-        # Run both windows' mainloops
+        # Run all three windows' mainloops
         while True:
-            # Check if either window is closed
-            if status_window_instance.closed or context_window_instance.closed:
+            # Check if any window is closed
+            if status_window_instance.closed or context_window_instance.closed or chat_monitor_instance.closed:
                 print("\nOne of the windows was closed. Exiting...")
                 logger.info("Window closed by user. Exiting main loop.")
                 break
@@ -2412,6 +2840,7 @@ if __name__ == "__main__":
             # Update both windows
             status_window_instance.root.update()
             context_window_instance.root.update()
+            chat_monitor_instance.root.update()
             time.sleep(0.1)
             
     except KeyboardInterrupt:
@@ -2420,14 +2849,16 @@ if __name__ == "__main__":
     finally:
         # Ensure both windows are closed
         if not status_window_instance.closed:
-            status_window_instance.on_close()
+            status_window_instance.on_close() 
         if not context_window_instance.closed:
             context_window_instance.on_close()
+        if not chat_monitor_instance.closed:
+            chat_monitor_instance.on_close()
         
         # Wait for game thread to finish (with timeout)
         if game_thread.is_alive():
             print("Waiting for game thread to finish...")
             game_thread.join(timeout=5.0)  # Wait up to 5 seconds for thread to finish
-            
-        print("Exiting AI Player.")
-        sys.exit(0)  # Force exit to ensure all threads are terminated
+    
+    print("Exiting AI Player.")
+    sys.exit(0)  # Force exit to ensure all threads are terminated

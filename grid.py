@@ -1,6 +1,7 @@
 from PIL import Image, ImageDraw, ImageFont
 import logging
 import os
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +26,17 @@ def add_numbered_grid_to_image(image, cell_size=40):
     grid_image = image.copy().convert("RGBA")
     
     # Create a separate transparent layer for the grid
-    grid_layer = Image.new("RGBA", grid_image.size, (0, 0, 0, 90))
+    grid_layer = Image.new("RGBA", grid_image.size, (0, 0, 0, 0))  # Fully transparent
     draw = ImageDraw.Draw(grid_layer)
     
-    # Add semi-transparent black background for the entire grid
-    width, height = grid_image.size
-    draw.rectangle([0, 0, width, height], fill=(0, 0, 0, 90))  # Black with 20% opacity (same as before)
-    
     # Grid colors
-    line_color = (255, 255, 255, 70)  # Semi-transparent white (47% opacity)
-    text_color = (255, 255, 255, 180)  # White for numbers (slightly transparent for better visibility)
+    line_color = (255, 255, 255, 40)  # Semi-transparent white (47% opacity)
+    text_color = (255, 255, 255, 180)  # White for numbers (slightly transparent)
+    shadow_color = (0, 0, 0, 100)  # Semi-transparent black for text shadow
     
     # Calculate grid dimensions
+    width, height = grid_image.size
+    cell_size = 40  # Size of each cell in pixels
     num_cols = width // cell_size
     num_rows = height // cell_size
     
@@ -59,7 +59,16 @@ def add_numbered_grid_to_image(image, cell_size=40):
         logger.warning("No system fonts found, using default font")
         font = ImageFont.load_default()
     
-    # Draw grid lines and cell numbers
+    # Draw grid lines
+    # Draw vertical lines
+    for x in range(0, width, cell_size):
+        draw.line([(x, 0), (x, height)], fill=line_color, width=1)
+    
+    # Draw horizontal lines
+    for y in range(0, height, cell_size):
+        draw.line([(0, y), (width, y)], fill=line_color, width=1)
+    
+    # Add cell numbers
     cell_number = 1
     for row in range(num_rows):
         for col in range(num_cols):
@@ -69,12 +78,8 @@ def add_numbered_grid_to_image(image, cell_size=40):
             x2 = x1 + cell_size
             y2 = y1 + cell_size
             
-            # Draw cell border
-            draw.rectangle([x1, y1, x2, y2], outline=line_color, width=1)
-            
-            # Draw cell number
+            # Get text size for centering
             number_str = str(cell_number)
-            # Get text size
             if hasattr(font, "getbbox"):
                 bbox = font.getbbox(number_str)
                 text_width = bbox[2] - bbox[0]
@@ -87,13 +92,17 @@ def add_numbered_grid_to_image(image, cell_size=40):
             text_x = x1 + (cell_size - text_width) // 2
             text_y = y1 + (cell_size - text_height) // 2
             
-            # Draw text directly
+            # Draw text shadow first (slightly offset)
+            draw.text((text_x + 2, text_y + 2), number_str, fill=shadow_color, font=font)
+            # Draw the actual text
             draw.text((text_x, text_y), number_str, fill=text_color, font=font)
             
             cell_number += 1
     
-    # Blend the grid layer with the original image
-    return Image.alpha_composite(grid_image, grid_layer)
+    # Composite the grid layer onto the image
+    grid_image = Image.alpha_composite(grid_image, grid_layer)
+    
+    return grid_image
 
 def get_cell_coordinates(cell_number, image_width=None, image_height=None, cell_size=40):
     """
@@ -137,4 +146,30 @@ def get_cell_coordinates(cell_number, image_width=None, image_height=None, cell_
     x = (col * cell_size) + (cell_size // 2)
     y = (row * cell_size) + (cell_size // 2)
     
-    return (x, y) 
+    return (x, y)
+
+def get_cell_number_from_pixel(x: int, y: int, image_width: int, image_height: int) -> Optional[int]:
+    """
+    Convert pixel coordinates to a cell number.
+    Returns None if coordinates are outside the image bounds.
+    """
+    if not (0 <= x < image_width and 0 <= y < image_height):
+        return None
+
+    # Calculate cell size
+    cell_size = 40  # Same as in add_numbered_grid_to_image
+    cells_per_row = image_width // cell_size
+    cells_per_col = image_height // cell_size
+
+    # Calculate cell coordinates
+    cell_x = x // cell_size
+    cell_y = y // cell_size
+
+    # Calculate cell number (1-based)
+    cell_number = (cell_y * cells_per_row) + cell_x + 1
+
+    # Check if cell number is valid
+    if 1 <= cell_number <= (cells_per_row * cells_per_col):
+        return cell_number
+
+    return None 

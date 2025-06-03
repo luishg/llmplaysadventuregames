@@ -4,4 +4,5 @@ requests>=2.31.0
 torch>=2.2.0
 transformers>=4.37.0
 accelerate>=0.27.0
-safetensors>=0.4.0 
+safetensors>=0.4.0
+twitchio>=2.8.0 
