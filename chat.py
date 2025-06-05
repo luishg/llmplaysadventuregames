@@ -12,11 +12,19 @@ import threading
 TWITCH_CHANNEL = "PointAndClickAI"
 TWITCH_TOKEN = os.getenv("TWITCH_TOKEN", "")  # Get token from environment variable
 
+# Security configuration
+GRID_SIZE = 100  # Maximum number of cells in the grid
+SCREEN_WIDTH = 1920  # Maximum screen width
+SCREEN_HEIGHT = 1080  # Maximum screen height
+
 # Global bot instance and message storage
 _global_bot = None
 _chat_messages = []
 _bot_running = False
 _bot_thread = None
+_last_processed_timestamp = None  # Track the last processed message timestamp
+_last_processed_message_id = None  # Track the last processed message ID
+_last_check_timestamp = None  # Track when we last checked for clicks
 
 class ClickParser:
     def __init__(self):
@@ -24,6 +32,26 @@ class ClickParser:
         self.cell_pattern = re.compile(r'click\s*\(?(\d+)\)?', re.IGNORECASE)
         # Pattern for pixel coordinates (e.g., "click (123, 456)", "click 123,456", etc.)
         self.pixel_pattern = re.compile(r'click\s*\(?(\d+)\s*,\s*(\d+)\)?', re.IGNORECASE)
+
+    def validate_cell(self, cell: int) -> bool:
+        """Validate if a cell number is within valid range."""
+        if not isinstance(cell, int):
+            print(f"[CHAT] Invalid cell number type: {type(cell)}")
+            return False
+        if cell < 1 or cell > GRID_SIZE:
+            print(f"[CHAT] Cell number {cell} out of range (1-{GRID_SIZE})")
+            return False
+        return True
+
+    def validate_pixel(self, x: int, y: int) -> bool:
+        """Validate if pixel coordinates are within valid range."""
+        if not isinstance(x, int) or not isinstance(y, int):
+            print(f"[CHAT] Invalid coordinate types: x={type(x)}, y={type(y)}")
+            return False
+        if x < 0 or x >= SCREEN_WIDTH or y < 0 or y >= SCREEN_HEIGHT:
+            print(f"[CHAT] Coordinates ({x}, {y}) out of range (0-{SCREEN_WIDTH-1}, 0-{SCREEN_HEIGHT-1})")
+            return False
+        return True
 
     def parse_message(self, message: str) -> List[Dict]:
         """Parse a message for click commands and return a list of click objects."""
@@ -33,21 +61,27 @@ class ClickParser:
         pixel_matches = self.pixel_pattern.finditer(message)
         for match in pixel_matches:
             x, y = map(int, match.groups())
-            clicks.append({
-                "type": "pixel",
-                "coordinates": [x, y],
-                "reason": f"User suggested click at pixel coordinates ({x}, {y})"
-            })
+            if self.validate_pixel(x, y):
+                clicks.append({
+                    "type": "pixel",
+                    "coordinates": [x, y],
+                    "reason": f"User suggested click at pixel coordinates ({x}, {y})"
+                })
+            else:
+                print(f"[CHAT] Rejected invalid pixel coordinates: ({x}, {y})")
         
         # Then check for cell numbers
         cell_matches = self.cell_pattern.finditer(message)
         for match in cell_matches:
             cell = int(match.group(1))
-            clicks.append({
-                "type": "cell",
-                "coordinates": cell,
-                "reason": f"User suggested click on cell {cell}"
-            })
+            if self.validate_cell(cell):
+                clicks.append({
+                    "type": "cell",
+                    "coordinates": cell,
+                    "reason": f"User suggested click on cell {cell}"
+                })
+            else:
+                print(f"[CHAT] Rejected invalid cell number: {cell}")
         
         return clicks
 
@@ -68,6 +102,7 @@ class TwitchChatBot(commands.Bot):
 
         # Store message with timestamp
         message_data = {
+            'id': message.id,  # Add message ID
             'user': message.author.name,
             'content': message.content,
             'timestamp': datetime.now(),
@@ -158,48 +193,80 @@ def start_twitch_bot():
 def get_recent_user_clicks(max_age_minutes: int = 5) -> Tuple[Optional[str], Optional[datetime], List[Dict]]:
     """
     Get clicks from the most recent user who posted click commands.
-    Works regardless of bot running status - useful for testing and edge cases.
-    Returns: (username, timestamp, list of click objects)
+    Returns up to 4 most recent clicks from the user, ordered from oldest to newest.
+    Only returns clicks from messages after the last check timestamp.
+    
+    Args:
+        max_age_minutes: Maximum age of messages to consider (default: 5 minutes)
+    
+    Returns:
+        Tuple of (username, timestamp of first click message, list of up to 4 click objects)
     """
-    global _chat_messages
+    global _chat_messages, _last_processed_message_id, _last_check_timestamp
     
     # Check if we have any messages at all
     if not _chat_messages:
+        print("[CHAT] No messages in chat history")
         return None, None, []
     
     # Filter messages that are not too old
     cutoff_time = datetime.now() - timedelta(minutes=max_age_minutes)
+    print(f"[CHAT] Checking messages since {cutoff_time.strftime('%H:%M:%S')}")
+    
+    # If we have a last check timestamp, use it as the minimum time
+    if _last_check_timestamp:
+        print(f"[CHAT] Last check was at {_last_check_timestamp.strftime('%H:%M:%S')}")
+        cutoff_time = max(cutoff_time, _last_check_timestamp)
     
     # Go through messages from newest to oldest to find the last user with clicks
     for msg in reversed(_chat_messages):
         # Skip messages that are too old
         if msg['timestamp'] < cutoff_time:
+            print(f"[CHAT] Skipping old message from {msg['timestamp'].strftime('%H:%M:%S')}")
+            continue
+            
+        # Skip if we've already processed this message
+        if msg.get('id') == _last_processed_message_id:
+            print(f"[CHAT] Skipping already processed message from {msg['timestamp'].strftime('%H:%M:%S')}")
             continue
             
         # If this message has clicks, this is our user
         if msg['clicks']:
             username = msg['user']
+            first_click_timestamp = msg['timestamp']
+            print(f"[CHAT] Found message with clicks from {username} at {first_click_timestamp.strftime('%H:%M:%S')}")
             
-            # Collect all recent clicks from this user (up to 4)
+            # Collect clicks from this user's messages, ordered from oldest to newest
             user_clicks = []
-            for user_msg in reversed(_chat_messages):
-                # Stop if we go too far back in time
+            for user_msg in _chat_messages:  # Process in chronological order
+                # Skip messages before the first click message
+                if user_msg['timestamp'] < first_click_timestamp:
+                    continue
+                    
+                # Skip messages that are too old
                 if user_msg['timestamp'] < cutoff_time:
-                    break
+                    continue
                     
                 # Only collect clicks from the same user
                 if user_msg['user'] == username and user_msg['clicks']:
                     user_clicks.extend(user_msg['clicks'])
+                    print(f"[CHAT] Added {len(user_msg['clicks'])} clicks from {username} at {user_msg['timestamp'].strftime('%H:%M:%S')}")
                     
                 # Limit to 4 clicks maximum
                 if len(user_clicks) >= 4:
+                    print(f"[CHAT] Reached maximum of 4 clicks for {username}")
                     break
             
-            # Return up to 4 clicks in the order they were sent
-            selected_clicks = user_clicks[:4]
-            return username, msg['timestamp'], selected_clicks
+            # If we found clicks, mark this message as processed and return them
+            if user_clicks:
+                selected_clicks = user_clicks[:4]  # Take up to 4 clicks
+                print(f"[CHAT] Returning {len(selected_clicks)} clicks from {username} (oldest to newest)")
+                _last_processed_message_id = msg.get('id')  # Mark this message as processed
+                _last_check_timestamp = datetime.now()  # Update last check timestamp
+                return username, first_click_timestamp, selected_clicks
     
-    # No recent clicks found
+    print("[CHAT] No recent clicks found in any messages")
+    _last_check_timestamp = datetime.now()  # Update last check timestamp even if no clicks found
     return None, None, []
 
 def is_chat_running() -> bool:
@@ -247,6 +314,27 @@ def initialize_twitch():
 def get_user_clicks() -> Tuple[Optional[str], Optional[datetime], List[Dict]]:
     """Legacy function - use get_recent_user_clicks() instead."""
     return get_recent_user_clicks()
+
+def set_security_parameters(grid_size: int = 100, screen_width: int = 1920, screen_height: int = 1080):
+    """Set the security parameters for click validation."""
+    global GRID_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT
+    
+    # Validate parameters
+    if grid_size < 1:
+        print(f"[CHAT] Invalid grid size: {grid_size}. Must be at least 1.")
+        return False
+        
+    if screen_width < 1 or screen_height < 1:
+        print(f"[CHAT] Invalid screen dimensions: {screen_width}x{screen_height}. Must be positive.")
+        return False
+        
+    # Update global parameters
+    GRID_SIZE = grid_size
+    SCREEN_WIDTH = screen_width
+    SCREEN_HEIGHT = screen_height
+    
+    print(f"[CHAT] Security parameters set: Grid={GRID_SIZE} cells, Screen={SCREEN_WIDTH}x{SCREEN_HEIGHT}")
+    return True
 
 if __name__ == "__main__":
     print("=== Twitch Chat Test ===")

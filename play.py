@@ -66,9 +66,9 @@ for lib_name in noisy_loggers_to_warn:
 # --- Configuration Constants ---
 DEFAULT_GAME_WINDOW_TITLE = "Maniac Mansion"
 SESSIONS_DIR = "sessions"
-SCREENSHOT_INTERVAL = 3  # Seconds to wait after LLM response before next screenshot
-CLICK_INTERVAL = 2       # Seconds between multiple clicks from a single LLM response
-CHAT_CHECK_INTERVAL = 5  # Check chat every N iterations
+SCREENSHOT_INTERVAL = 4  # Seconds to wait after LLM response before next screenshot
+CLICK_INTERVAL = 3       # Seconds between multiple clicks from a single LLM response
+CHAT_CHECK_INTERVAL = 3  # Check chat every N iterations
 INTERNAL_CROP = {"top": 0, "bottom": 0, "left": 0, "right": 0} # ScummVM padding
 
 # --- API Keys (Load from environment variables) ---
@@ -613,7 +613,7 @@ def get_openai_llm_analysis(model_id, base64_image_data_url, image_width, image_
     
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     # System prompt can remain general, as the detailed context is now in the user prompt
-    #system_prompt = "You are an AI agent playing the game Maniac Mansion. Analyze the provided game screenshot and decide on the best next action. The image has a reference grid. Output your response in JSON format with 'description', 'action_plan', and 'clicks' (list of [x,y] coordinates relative to the image, using the grid)."
+    system_prompt = "You are an AI agent playing the game Maniac Mansion. Analyze the provided game screenshot and decide on the best next action.)."
     user_prompt_text = get_llm_prompt_text(image_width, image_height) 
 
     try:
@@ -685,7 +685,7 @@ def get_anthropic_llm_analysis(model_id, base64_image_raw, image_width, image_he
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     # System prompt can remain general
-    #system_prompt = "You are an AI agent playing the game Maniac Mansion. Analyze the provided game screenshot and decide on the best next action. The image has a reference grid. Output your response in JSON format with 'description', 'action_plan', and 'clicks' (list of [x,y] coordinates relative to the image, using the grid)."
+    system_prompt = "You are an AI agent playing a point and click adventure game. Analyze the provided game screenshot and decide on the best next action."
     user_prompt_text = get_llm_prompt_text(image_width, image_height) 
 
     try:
@@ -1134,10 +1134,10 @@ class StatusWindow:
     def _process_update(self, update_data):
         try:
             # Update iteration counter
-            self.iteration_label.config(text=f"Iteration: {update_data['iteration']}")
+            self.iteration_label.config(text=f"{update_data['iteration']}")
             
             # Update LLM info (name only)
-            self.llm_name_label.config(text=f"LLM: {update_data['llm_name']}")
+            self.llm_name_label.config(text=f"{update_data['llm_name']}")
             
             # Update game info
             self.game_name_label.config(text=update_data['game_name'])
@@ -1256,7 +1256,7 @@ class StatusWindow:
         game_info_frame = ttk.Frame(game_frame)
         game_info_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        ttk.Label(game_info_frame, text="Game:").pack(side=tk.LEFT)
+        ttk.Label(game_info_frame, text="Game screenshot + grid:").pack(side=tk.LEFT)
         self.game_name_label = ttk.Label(game_info_frame, text="N/A")
         self.game_name_label.pack(side=tk.LEFT, padx=5)
         
@@ -1281,7 +1281,7 @@ class StatusWindow:
         self.plan_text.config(state=tk.DISABLED)
         
         # Action Clicks
-        clicks_frame = ttk.LabelFrame(game_frame, text="Action Clicks")
+        clicks_frame = ttk.LabelFrame(game_frame, text="Clicks to be executed")
         clicks_frame.pack(fill=tk.X, padx=5, pady=5)
         
         self.clicks_text = scrolledtext.ScrolledText(clicks_frame, wrap=tk.WORD, height=3)
@@ -1632,7 +1632,7 @@ class ChatMonitorWindow:
         self.stats_label.pack(fill=tk.X, pady=2)
         
         # Chat messages section
-        messages_frame = ttk.LabelFrame(main_frame, text="Recent Chat Messages", padding="5")
+        messages_frame = ttk.LabelFrame(main_frame, text="Checked Chat Messages to find valid clicks", padding="5")
         messages_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         # Create text widget with scrollbar
@@ -1675,18 +1675,19 @@ class ChatMonitorWindow:
         self.update_queue = queue.Queue()
         self.last_message_count = 0
         
-        # Start monitoring
-        self.monitor_chat()
+        # Start polling for updates
         self.poll_updates()
-        
-    def monitor_chat(self):
-        """Monitor chat messages and update display"""
+    
+    def check_chat(self, iteration_count):
+        """Check chat messages and update display - called by main loop"""
         try:
             if is_chat_running():
                 # Get chat statistics
                 stats = get_chat_stats()
+                current_time = datetime.now().strftime("%H:%M:%S")
                 stats_text = (f"Connected | Messages: {stats['total_messages']} | "
-                            f"Users: {stats['unique_users']} | Recent: {stats['recent_activity']}")
+                            f"Users: {stats['unique_users']} | Recent: {stats['recent_activity']} | "
+                            f"Last Check: {current_time}")
                 
                 self.update_queue.put(("status", "Chat Status: Connected ✓", "green"))
                 self.update_queue.put(("stats", stats_text, "black"))
@@ -1719,19 +1720,19 @@ class ChatMonitorWindow:
                     time_str = timestamp.strftime("%H:%M:%S") if timestamp else "Unknown"
                     clicks_text = f"Last: {username} at {time_str} ({len(clicks)} clicks)"
                     self.update_queue.put(("recent_clicks", clicks_text, "darkgreen"))
+                    return username, timestamp, clicks  # Return the clicks we found
                 else:
                     self.update_queue.put(("recent_clicks", "No recent clicks", "gray"))
+                    return None, None, None  # Return None if no clicks found
                     
             else:
                 self.update_queue.put(("status", "Chat Status: Disconnected ✗", "red"))
                 self.update_queue.put(("stats", "Not connected to chat", "red"))
+                return None, None, None
                 
         except Exception as e:
             self.update_queue.put(("status", f"Chat Status: Error - {str(e)}", "red"))
-        
-        # Schedule next update
-        if not self.closed:
-            self.root.after(2000, self.monitor_chat)  # Update every 2 seconds
+            return None, None, None
     
     def poll_updates(self):
         """Process queued updates"""
@@ -2014,7 +2015,7 @@ def update_game_objectives(selected_model_info, descriptions, current_objectives
             response = client.messages.create(
                 model=selected_model_info['model_id'],
                 max_tokens=1024,
-                system="You are an AI playing Monkey Island 2, analyzing game progress to update objectives.",
+                system="You are an AI playing a click and point game, analyzing game progress to update objectives.",
                 messages=[{"role": "user", "content": prompt}]
             )
             objectives_json = json.loads(response.content[0].text)
@@ -2112,9 +2113,9 @@ def game_logic_thread_target(status_window_ref, context_window_ref, chat_monitor
     if not active_session_dir: 
         return
     
-    print(f"Initializing AI Player for Maniac Mansion...")
+    print(f"Initializing AI Player...")
     print(f"Session data will be saved in: {active_session_dir}") 
-    logger.info(f"Initializing Maniac Mansion AI Player (PID: {os.getpid()})")
+    logger.info(f"Initializing AI Player (PID: {os.getpid()})")
     logger.info(f"Session data will be saved in: {active_session_dir}")
 
     pyautogui.FAILSAFE = True
@@ -2476,7 +2477,10 @@ def game_logic_thread_target(status_window_ref, context_window_ref, chat_monitor
 
             # Check chat every CHAT_CHECK_INTERVAL iterations
             if chat_enabled and iteration_count % CHAT_CHECK_INTERVAL == 0:
-                print("\n=== Checking Twitch Chat for User Suggestions ===")
+                print(f"\n=== Checking Twitch Chat for User Suggestions (Iteration {iteration_count}) ===")
+                
+                # Update chat monitor window and get clicks
+                username, timestamp, chat_clicks = chat_monitor_ref.check_chat(iteration_count)
                 
                 # Get chat statistics
                 chat_stats = get_chat_stats()
@@ -2485,8 +2489,6 @@ def game_logic_thread_target(status_window_ref, context_window_ref, chat_monitor
                     print(f"[CHAT] Last user with clicks: {chat_stats['last_user_with_clicks']}")
 
                 try:
-                    username, timestamp, chat_clicks = get_recent_user_clicks()
-                    
                     if chat_clicks and username:
                         print(f"\n[CHAT] Found {len(chat_clicks)} clicks from last user: {username}")
                         print(f"[CHAT] Timestamp: {timestamp.strftime('%H:%M:%S') if timestamp else 'Unknown'}")
