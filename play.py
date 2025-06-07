@@ -67,7 +67,7 @@ for lib_name in noisy_loggers_to_warn:
 DEFAULT_GAME_WINDOW_TITLE = "Maniac Mansion"
 SESSIONS_DIR = "sessions"
 SCREENSHOT_INTERVAL = 4  # Seconds to wait after LLM response before next screenshot
-CLICK_INTERVAL = 3       # Seconds between multiple clicks from a single LLM response
+CLICK_INTERVAL = 4       # Seconds between multiple clicks from a single LLM response
 CHAT_CHECK_INTERVAL = 3  # Check chat every N iterations
 INTERNAL_CROP = {"top": 0, "bottom": 0, "left": 0, "right": 0} # ScummVM padding
 
@@ -85,7 +85,21 @@ if not HUGGINGFACE_TOKEN:
     print("[!] Warning: HUGGINGFACE_TOKEN environment variable not set. Hugging Face models will not be available.")
 
 # --- Global LLM Game Context ---
-LLM_GAME_CONTEXT = "I'm playing a point-and-click adventure game. I have to explore how the story unfolds through what I see on the screen."
+LLM_GAME_CONTEXT = """You are playing Day of the Tentacle, a classic point-and-click adventure game. You will take on the role of three college students:
+
+Bernard Bernoulli, the nerdy leader,
+
+Hoagie, the laid-back roadie,
+
+and Laverne, the quirky med student.
+
+Your mission: stop the evil Purple Tentacle from taking over the world.
+
+To stop him, you and your friends must travel through time—past, present, and future—solving bizarre puzzles, interacting with historical figures, and manipulating objects across timelines. Each student is trapped in a different era, but items can be sent between them through a time-traveling porta-toilet called the Chron-O-John.
+
+Your goal is to work together across time periods, outsmart Purple Tentacle, and save humanity.
+
+You are the AI controlling all three students. Think logically, act creatively, and remember: everything is connected through time. Let's begin."""
 
 # --- Global variable for selected game window title ---
 SELECTED_GAME_WINDOW_TITLE = DEFAULT_GAME_WINDOW_TITLE
@@ -94,7 +108,6 @@ SELECTED_GAME_WINDOW_ID = None # Add new global for the selected window's ID
 # --- Global variables for LLM context and history ---
 LLM_LAST_ACTIONS = []  # List to store last 10 actions
 MAX_ACTIONS_HISTORY = 10  # Maximum number of actions to keep in history
-LLM_GAME_CONTEXT = "I'm playing a point-and-click adventure game. I have to explore how the story unfolds through what I see on the screen."
 TEMP_DESCRIPTIONS = []  # List to store descriptions for context updates
 DESCRIPTIONS_BEFORE_UPDATE = 10  # Number of descriptions to collect before updating context
 GAME_MAP_GRAPH = "No map data available yet."  # Store the current map graph
@@ -136,9 +149,7 @@ Important Tips:
   - You can perform multiple actions in sequence, BUT define one clic per action
   - Avoid to repeat the same actions on your recent action list
   - Prioritizeze exploration, looking for exist to new areas (screen edges, stairs, doors)
-  - Look for hidden passages and secret areas
-  - Pay attention to character reactions
-  - Some items can be combined in inventory
+  - If there is not action menu, you are probably on a cutscene or a dialog, so no click needed.
 
 Remember: The game requires creative thinking and trying different combinations of actions and objects."""
 
@@ -166,7 +177,6 @@ The image has grid overlay with numbered cells (ignore the grid and numbers to p
 - When you want to click somewhere:
   1. Look at the grid overlay and find the cell number closest to where you want to click
   2. Use that cell number as the "coordinates" value
-  3. If the exact location is between cells, choose the closest cell number
 
 Game Context:
 {game_context}
@@ -1792,6 +1802,7 @@ Based on these observations and the current context, formulate a new game strate
 2. Identifies any patterns or recurring elements
 3. Suggests a focused approach for the next phase of gameplay
 4. Updates our understanding of the game's mechanics and puzzles
+5. Keep it short and concise, just the most important combined information so it is not growing indefinitely.
 
 Output your response in this format:
 ```json
@@ -1878,6 +1889,7 @@ Based on these observations and the current map, create an updated map that:
 2. Shows how rooms are connected (e.g., "Room A connects to Room B via door")
 3. Includes any special notes about rooms (e.g., "Room C has a locked chest")
 4. Maintains previous map information while adding new discoveries triying to create a mental map of the game
+5. Keep it short and concise, just the most important combined information so it is not growing indefinitely.
 
 Output your response in this format:
 ```json
@@ -1908,7 +1920,7 @@ Based on these observations and current objectives, create an updated list of ob
 2. Prioritizes objectives based on available information
 3. Notes any completed objectives
 4. Maintains previous objectives while adding new ones
-5. Includes any clues or hints found
+5. Keep it short and concise, just the most important combined information so it is not growing indefinitely.
 
 Output your response in this format:
 ```json
@@ -1946,7 +1958,7 @@ def update_game_map(selected_model_info, descriptions, current_map):
                 model=selected_model_info['model_id'],
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": "You are an AI playing Monkey Island 2, analyzing game progress to update the map."},
+                    {"role": "system", "content": "You are an AI playing a point and click adventure game, analyzing game progress to update the map."},
                     {"role": "user", "content": prompt}
                 ]
             )
@@ -1956,7 +1968,7 @@ def update_game_map(selected_model_info, descriptions, current_map):
             response = client.messages.create(
                 model=selected_model_info['model_id'],
                 max_tokens=1024,
-                system="You are an AI playing Monkey Island 2, analyzing game progress to update the map.",
+                system="You are an AI playing a point and click adventure game, analyzing game progress to update the map.",
                 messages=[{"role": "user", "content": prompt}]
             )
             map_json = json.loads(response.content[0].text)
@@ -2005,7 +2017,7 @@ def update_game_objectives(selected_model_info, descriptions, current_objectives
                 model=selected_model_info['model_id'],
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": "You are an AI playing Monkey Island 2, analyzing game progress to update objectives."},
+                    {"role": "system", "content": "You are an AI playing a point and click adventure game, analyzing game progress to update objectives."},
                     {"role": "user", "content": prompt}
                 ]
             )

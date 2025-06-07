@@ -1,7 +1,10 @@
 #!/bin/bash
 
-# Exit on any error
-set -e
+# Function to handle errors gracefully
+handle_error() {
+    echo "Error occurred in section: $1"
+    echo "Continuing with installation..."
+}
 
 echo "=========================================="
 echo "LLM Plays Adventure Games - Fedora Setup"
@@ -9,20 +12,20 @@ echo "=========================================="
 
 # Update system and install basic development tools
 echo "Updating system and installing basic development tools..."
-sudo dnf update -y
-sudo dnf groupinstall -y "Development Tools"
-sudo dnf install -y python3 python3-pip python3-devel python3-tkinter
+sudo dnf update -y || handle_error "system update"
+sudo dnf install -y '@development-tools' --skip-unavailable || handle_error "development tools"
+sudo dnf install -y python3 python3-pip python3-devel python3-tkinter --skip-unavailable || handle_error "python packages"
 
 # Install X11 tools and development libraries (CRITICAL for window capture and automation)
 echo "Installing X11 tools and development libraries..."
 sudo dnf install -y \
     xdotool \
     xprop \
-    xorg-x11-utils \
     libX11-devel \
     libXext-devel \
     libXrender-devel \
-    libXtst-devel
+    libXtst-devel \
+    --skip-unavailable || handle_error "X11 tools"
 
 # Install additional system libraries
 echo "Installing additional system libraries..."
@@ -68,17 +71,18 @@ sudo dnf install -y \
     nss \
     pango \
     pixman \
-    zlib
+    zlib \
+    --skip-unavailable || handle_error "system libraries"
 
 # Install Ollama (Local LLM support - OPTIONAL but recommended)
 echo "Installing Ollama for local LLM support..."
 if ! command -v ollama &> /dev/null; then
     echo "Installing Ollama..."
-    curl -fsSL https://ollama.ai/install.sh | sh
+    curl -fsSL https://ollama.ai/install.sh | sh || handle_error "ollama installation"
     
     # Start ollama service
-    sudo systemctl enable ollama
-    sudo systemctl start ollama
+    sudo systemctl enable ollama || handle_error "ollama service enable"
+    sudo systemctl start ollama || handle_error "ollama service start"
     
     echo "Ollama installed successfully!"
     echo "To install models, run: ollama pull llama2"
@@ -88,18 +92,18 @@ fi
 
 # Create and activate virtual environment
 echo "Setting up Python virtual environment..."
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv || handle_error "venv creation"
+source venv/bin/activate || handle_error "venv activation"
 
 # Upgrade pip and install wheel
 echo "Upgrading pip and installing wheel..."
-pip install --upgrade pip
-pip install wheel
+pip install --upgrade pip || handle_error "pip upgrade"
+pip install wheel || handle_error "wheel installation"
 
 # Install Python dependencies from requirements.txt
 echo "Installing Python dependencies from requirements.txt..."
 if [ -f "requirements.txt" ]; then
-    pip install -r requirements.txt
+    pip install -r requirements.txt || handle_error "requirements.txt installation"
 else
     echo "Warning: requirements.txt not found, installing known dependencies..."
 fi
@@ -121,8 +125,7 @@ pip install \
     twitchio \
     ollama \
     openai \
-    anthropic
-
+    anthropic || handle_error "python packages installation"
 
 # Set up environment variables in ~/.bashrc
 echo "Setting up environment variables..."
@@ -146,7 +149,7 @@ chmod +x chat.py
 
 echo ""
 echo "=========================================="
-echo "Installation completed successfully!"
+echo "Installation completed!"
 echo "=========================================="
 echo ""
 echo "NEXT STEPS:"
